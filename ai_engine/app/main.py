@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import List, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -52,6 +52,14 @@ from app.agents.market_agent import MarketAgent
 from app.agents.clinical_agent import ClinicalAgent
 from app.agents.patent_agent import PatentAgent
 from app.agents.vision_agent import VisionAgent
+from app.agents.validation_agent import ValidationAgent
+from app.agents.kol_finder_agent import KOLFinderAgent
+from app.agents.pathfinder_agent import MolecularPathfinderAgent
+from app.agents.iqvia_agent import IQVIAInsightsAgent
+from app.agents.exim_agent import EXIMAgent
+from app.agents.web_intelligence_agent import WebIntelligenceAgent
+from app.agents.internal_knowledge_agent import InternalKnowledgeAgent
+from app.agents.orchestrator import MasterOrchestrator
 from app.core.config import settings
 from app.core.privacy_toggle import PrivacyManager
 
@@ -71,9 +79,61 @@ class AnalyzeRequest(BaseModel):
     )
 
 
+class OrchestratedRequest(BaseModel):
+    """Request model for orchestrated multi-agent analysis"""
+    query: str = Field(..., min_length=5, description="Natural language research query")
+    molecule: Optional[str] = Field(None, description="Specific molecule name if applicable")
+    disease: Optional[str] = Field(None, description="Target disease if applicable")
+    mode: str = Field(default="cloud", pattern="^(secure|cloud)$")
+    request_id: str = Field(..., description="Unique request identifier")
+
+
+class KOLRequest(BaseModel):
+    """Request for Key Opinion Leader search"""
+    molecule: str = Field(..., description="Molecule name")
+    disease: str = Field(..., description="Disease indication")
+    request_id: str = Field(..., description="Unique request identifier")
+
+
+class PathwayRequest(BaseModel):
+    """Request for molecular pathway analysis"""
+    molecule: str = Field(..., description="Source molecule")
+    disease: str = Field(..., description="Target disease")
+    max_hops: int = Field(default=3, ge=1, le=5, description="Maximum path length")
+    request_id: str = Field(..., description="Unique request identifier")
+
+
 class ROIRequest(BaseModel):
     """Request model for ROI calculation"""
     molecule: str = Field(..., min_length=2, description="Name of the drug/compound")
+    request_id: str = Field(..., description="Unique request identifier")
+
+
+class EXIMRequest(BaseModel):
+    """Request for EXIM trade intelligence analysis"""
+    molecule: str = Field(..., min_length=2, description="Molecule/API name")
+    region: str = Field(default="global", description="Target region for analysis")
+    request_id: str = Field(..., description="Unique request identifier")
+
+
+class IQVIARequest(BaseModel):
+    """Request for IQVIA market intelligence analysis"""
+    molecule: str = Field(..., min_length=2, description="Molecule name")
+    disease: str = Field(..., min_length=2, description="Target disease indication")
+    request_id: str = Field(..., description="Unique request identifier")
+
+
+class WebIntelRequest(BaseModel):
+    """Request for web intelligence gathering"""
+    query: str = Field(..., min_length=3, description="Search query")
+    sources: list[str] = Field(default=["pubmed", "news", "regulatory"], description="Sources to search")
+    request_id: str = Field(..., description="Unique request identifier")
+
+
+class InternalKnowledgeRequest(BaseModel):
+    """Request for internal knowledge base search"""
+    query: str = Field(..., min_length=3, description="Search query")
+    document_types: list[str] = Field(default=["all"], description="Document types to search")
     request_id: str = Field(..., description="Unique request identifier")
 
 
@@ -98,12 +158,28 @@ async def lifespan(app: FastAPI):
                 cloud=settings.CLOUD_ENABLED, 
                 local=settings.LOCAL_ENABLED)
     
-    # Initialize agents
+    # Initialize core agents
     app.state.market_agent = MarketAgent()
     app.state.clinical_agent = ClinicalAgent()
     app.state.patent_agent = PatentAgent()
     app.state.vision_agent = VisionAgent()
     app.state.privacy_manager = PrivacyManager()
+    
+    # Initialize new agents
+    app.state.validation_agent = ValidationAgent()
+    app.state.kol_finder = KOLFinderAgent()
+    app.state.pathfinder = MolecularPathfinderAgent()
+    
+    # Initialize mandatory domain expert agents
+    app.state.exim_agent = EXIMAgent()
+    app.state.iqvia_agent = IQVIAInsightsAgent()
+    app.state.web_intel_agent = WebIntelligenceAgent()
+    app.state.internal_knowledge_agent = InternalKnowledgeAgent()
+    
+    # Initialize orchestrator (creates its own agent instances)
+    app.state.orchestrator = MasterOrchestrator()
+    
+    logger.info("✅ All agents initialized successfully (12 agents total)")
     
     yield
     
@@ -344,10 +420,435 @@ async def get_agents_status():
             {"name": "ClinicalAgent", "status": "active", "version": "1.0.0"},
             {"name": "PatentAgent", "status": "active", "version": "1.0.0"},
             {"name": "MarketAgent", "status": "active", "version": "1.0.0"},
-            {"name": "VisionAgent", "status": "active", "version": "1.0.0"}
+            {"name": "VisionAgent", "status": "active", "version": "1.0.0"},
+            {"name": "ValidationAgent", "status": "active", "version": "1.0.0"},
+            {"name": "KOLFinderAgent", "status": "active", "version": "1.0.0"},
+            {"name": "MolecularPathfinderAgent", "status": "active", "version": "1.0.0"},
+            {"name": "MasterOrchestrator", "status": "active", "version": "1.0.0"}
         ],
         "orchestrator": "active",
         "knowledge_graph": "connected"
+    }
+
+
+@app.post("/api/orchestrate")
+async def orchestrate_analysis(request: OrchestratedRequest):
+    """
+    Master orchestration endpoint - coordinates all agents intelligently.
+    
+    The orchestrator:
+    1. Analyzes the query to determine required agents
+    2. Executes agents in optimal order (parallel when possible)
+    3. Validates results with the Skeptic agent
+    4. Returns comprehensive, validated analysis
+    """
+    logger.info(
+        "orchestrated_analysis_requested",
+        query=request.query[:100],
+        molecule=request.molecule,
+        disease=request.disease,
+        request_id=request.request_id
+    )
+    
+    try:
+        orchestrator: MasterOrchestrator = app.state.orchestrator
+        privacy_manager: PrivacyManager = app.state.privacy_manager
+        llm_config = privacy_manager.get_llm_config(request.mode)
+        
+        result = await orchestrator.process_query(
+            query=request.query,
+            molecule=request.molecule or "Unknown",
+            llm_config=llm_config
+        )
+        
+        return {
+            "success": True,
+            "request_id": request.request_id,
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error(
+            "orchestration_failed",
+            request_id=request.request_id,
+            error=str(e)
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Orchestration failed: {str(e)}"
+        )
+
+
+@app.post("/api/agents/validate")
+async def validate_findings(request: dict):
+    """
+    Skeptic validation endpoint - validates findings from other agents.
+    Returns risk flags, confidence scores, and recommendations.
+    """
+    try:
+        validation_agent: ValidationAgent = app.state.validation_agent
+        privacy_manager: PrivacyManager = app.state.privacy_manager
+        llm_config = privacy_manager.get_llm_config("cloud")
+        
+        result = await validation_agent.analyze(
+            molecule=request.get("molecule", "Unknown"),
+            agent_results=request.get("findings", {}),
+            llm_config=llm_config
+        )
+        
+        return {
+            "success": True,
+            "validation": result
+        }
+        
+    except Exception as e:
+        logger.error("validation_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
+
+
+@app.post("/api/agents/kol")
+async def find_kol(request: KOLRequest):
+    """
+    Key Opinion Leader search endpoint.
+    Finds top researchers and labs for a molecule-disease pair.
+    """
+    logger.info(
+        "kol_search_requested",
+        molecule=request.molecule,
+        disease=request.disease,
+        request_id=request.request_id
+    )
+    
+    try:
+        kol_finder: KOLFinderAgent = app.state.kol_finder
+        privacy_manager: PrivacyManager = app.state.privacy_manager
+        llm_config = privacy_manager.get_llm_config("cloud")
+        
+        result = await kol_finder.analyze(
+            molecule=request.molecule,
+            llm_config=llm_config
+        )
+        
+        return {
+            "success": True,
+            "request_id": request.request_id,
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error("kol_search_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"KOL search failed: {str(e)}")
+
+
+@app.post("/api/agents/pathways")
+async def find_pathways(request: PathwayRequest):
+    """
+    Molecular pathway analysis using GraphRAG.
+    Finds biological connections between molecule and disease.
+    """
+    logger.info(
+        "pathway_analysis_requested",
+        molecule=request.molecule,
+        disease=request.disease,
+        max_hops=request.max_hops,
+        request_id=request.request_id
+    )
+    
+    try:
+        pathfinder: MolecularPathfinderAgent = app.state.pathfinder
+        privacy_manager: PrivacyManager = app.state.privacy_manager
+        llm_config = privacy_manager.get_llm_config("cloud")
+        
+        result = await pathfinder.analyze(
+            molecule=request.molecule,
+            llm_config=llm_config
+        )
+        
+        return {
+            "success": True,
+            "request_id": request.request_id,
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error("pathway_analysis_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Pathway analysis failed: {str(e)}")
+
+
+# ======================
+# EXIM TRADE INTELLIGENCE
+# ======================
+
+@app.post("/api/agents/exim")
+async def analyze_trade_intelligence(request: EXIMRequest):
+    """
+    EXIM Trends Agent - Trade Intelligence Analysis.
+    Provides global trade flows, sourcing hubs, supply risk flags.
+    """
+    logger.info(
+        "exim_analysis_requested",
+        molecule=request.molecule,
+        region=request.region,
+        request_id=request.request_id
+    )
+    
+    try:
+        exim_agent: EXIMAgent = app.state.exim_agent
+        privacy_manager: PrivacyManager = app.state.privacy_manager
+        llm_config = privacy_manager.get_llm_config("cloud")
+        
+        result = await exim_agent.analyze(
+            molecule=request.molecule,
+            llm_config=llm_config
+        )
+        
+        return {
+            "success": True,
+            "request_id": request.request_id,
+            "agent": "EXIM Trends Agent",
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error("exim_analysis_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"EXIM analysis failed: {str(e)}")
+
+
+@app.get("/api/agents/exim/sourcing-hubs")
+async def get_sourcing_hubs():
+    """Get global API sourcing hubs ranking"""
+    exim_agent: EXIMAgent = app.state.exim_agent
+    return {
+        "success": True,
+        "data": exim_agent.global_sourcing_hubs
+    }
+
+
+# ======================
+# IQVIA MARKET INTELLIGENCE
+# ======================
+
+@app.post("/api/agents/iqvia")
+async def analyze_market_intelligence(request: IQVIARequest):
+    """
+    IQVIA Insights Agent - Commercial Viability Analysis.
+    Provides market size, CAGR, volume shifts, competitor analysis.
+    """
+    logger.info(
+        "iqvia_analysis_requested",
+        molecule=request.molecule,
+        disease=request.disease,
+        request_id=request.request_id
+    )
+    
+    try:
+        iqvia_agent: IQVIAInsightsAgent = app.state.iqvia_agent
+        privacy_manager: PrivacyManager = app.state.privacy_manager
+        llm_config = privacy_manager.get_llm_config("cloud")
+        
+        result = await iqvia_agent.analyze(
+            molecule=request.molecule,
+            disease=request.disease,
+            llm_config=llm_config
+        )
+        
+        return {
+            "success": True,
+            "request_id": request.request_id,
+            "agent": "IQVIA Insights Agent",
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error("iqvia_analysis_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"IQVIA analysis failed: {str(e)}")
+
+
+@app.post("/api/agents/iqvia/roi")
+async def calculate_market_roi(request: IQVIARequest):
+    """Calculate ROI estimation using IQVIA market data"""
+    logger.info(
+        "iqvia_roi_requested",
+        molecule=request.molecule,
+        disease=request.disease,
+        request_id=request.request_id
+    )
+    
+    try:
+        iqvia_agent: IQVIAInsightsAgent = app.state.iqvia_agent
+        privacy_manager: PrivacyManager = app.state.privacy_manager
+        llm_config = privacy_manager.get_llm_config("cloud")
+        
+        result = await iqvia_agent.calculate_roi(
+            molecule=request.molecule,
+            disease=request.disease,
+            llm_config=llm_config
+        )
+        
+        return {
+            "success": True,
+            "request_id": request.request_id,
+            "agent": "IQVIA Insights Agent",
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error("iqvia_roi_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"IQVIA ROI calculation failed: {str(e)}")
+
+
+# ======================
+# WEB INTELLIGENCE
+# ======================
+
+@app.post("/api/agents/web-intel")
+async def gather_web_intelligence(request: WebIntelRequest):
+    """
+    Web Intelligence Agent - Real-Time Signals.
+    Gathers data from PubMed, news, regulatory sources.
+    """
+    logger.info(
+        "web_intel_requested",
+        query=request.query,
+        sources=request.sources,
+        request_id=request.request_id
+    )
+    
+    try:
+        web_agent: WebIntelligenceAgent = app.state.web_intel_agent
+        privacy_manager: PrivacyManager = app.state.privacy_manager
+        llm_config = privacy_manager.get_llm_config("cloud")
+        
+        result = await web_agent.analyze(
+            query=request.query,
+            llm_config=llm_config
+        )
+        
+        return {
+            "success": True,
+            "request_id": request.request_id,
+            "agent": "Web Intelligence Agent",
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error("web_intel_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Web intelligence gathering failed: {str(e)}")
+
+
+@app.get("/api/agents/web-intel/pubmed/{query}")
+async def search_pubmed(query: str, limit: int = 10):
+    """Search PubMed for scientific publications"""
+    web_agent: WebIntelligenceAgent = app.state.web_intel_agent
+    
+    try:
+        result = await web_agent.search_pubmed(query, limit)
+        return {
+            "success": True,
+            "source": "PubMed",
+            "data": result
+        }
+    except Exception as e:
+        logger.error("pubmed_search_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"PubMed search failed: {str(e)}")
+
+
+@app.get("/api/agents/web-intel/news/{query}")
+async def search_news(query: str, limit: int = 10):
+    """Search news sources for regulatory updates"""
+    web_agent: WebIntelligenceAgent = app.state.web_intel_agent
+    
+    try:
+        result = await web_agent.search_news(query, limit)
+        return {
+            "success": True,
+            "source": "News & Regulatory",
+            "data": result
+        }
+    except Exception as e:
+        logger.error("news_search_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"News search failed: {str(e)}")
+
+
+# ======================
+# INTERNAL KNOWLEDGE BASE
+# ======================
+
+@app.post("/api/agents/internal-knowledge")
+async def search_internal_knowledge(request: InternalKnowledgeRequest):
+    """
+    Internal Knowledge Agent - Proprietary Intelligence.
+    Searches internal documents using Local LLM for privacy.
+    """
+    logger.info(
+        "internal_knowledge_requested",
+        query=request.query,
+        document_types=request.document_types,
+        request_id=request.request_id
+    )
+    
+    try:
+        internal_agent: InternalKnowledgeAgent = app.state.internal_knowledge_agent
+        privacy_manager: PrivacyManager = app.state.privacy_manager
+        llm_config = privacy_manager.get_llm_config("local")  # Always use local LLM for internal docs
+        
+        result = await internal_agent.analyze(
+            query=request.query,
+            llm_config=llm_config
+        )
+        
+        return {
+            "success": True,
+            "request_id": request.request_id,
+            "agent": "Internal Knowledge Agent",
+            "privacy_mode": "local",
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error("internal_knowledge_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Internal knowledge search failed: {str(e)}")
+
+
+@app.post("/api/agents/internal-knowledge/ingest")
+async def ingest_document(file: UploadFile = File(...)):
+    """
+    Ingest a document into the internal knowledge base.
+    Supports PDF, DOCX, TXT, PPTX formats.
+    """
+    logger.info("document_ingestion_requested", filename=file.filename)
+    
+    try:
+        internal_agent: InternalKnowledgeAgent = app.state.internal_knowledge_agent
+        
+        # Read file content
+        content = await file.read()
+        
+        result = await internal_agent.ingest_document(
+            filename=file.filename,
+            content=content,
+            content_type=file.content_type
+        )
+        
+        return {
+            "success": True,
+            "message": f"Document '{file.filename}' ingested successfully",
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error("document_ingestion_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Document ingestion failed: {str(e)}")
+
+
+@app.get("/api/agents/internal-knowledge/documents")
+async def list_internal_documents():
+    """List all ingested internal documents"""
+    internal_agent: InternalKnowledgeAgent = app.state.internal_knowledge_agent
+    
+    return {
+        "success": True,
+        "data": internal_agent.list_documents()
     }
 
 

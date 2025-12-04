@@ -14,6 +14,9 @@ const morgan = require('morgan');
 
 const { logger } = require('./utils/logger');
 const researchRoutes = require('./routes/researchRoutes');
+const watchlistRoutes = require('./routes/watchlist');
+const archivalRoutes = require('./routes/archivalRoutes');
+const { createRateLimiter, dynamicRateLimiter } = require('./utils/rateLimiter');
 
 // Initialize Express app
 const app = express();
@@ -26,9 +29,25 @@ const PORT = process.env.PORT || 3001;
 // Security headers
 app.use(helmet());
 
-// CORS configuration
+// CORS configuration - allow multiple frontend ports for development
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:5175',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+  process.env.CLIENT_URL
+].filter(Boolean);
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:5173',
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID']
@@ -44,6 +63,9 @@ app.use(morgan('combined', {
     write: (message) => logger.info(message.trim())
   }
 }));
+
+// Rate limiting
+app.use('/api/', dynamicRateLimiter);
 
 // ======================
 // API ROUTES
@@ -61,6 +83,12 @@ app.get('/health', (req, res) => {
 
 // Research API routes
 app.use('/api/research', researchRoutes);
+
+// Watchlist API routes
+app.use('/api/watchlist', watchlistRoutes);
+
+// Archival/Report History API routes
+app.use('/api/archive', archivalRoutes);
 
 // ======================
 // ERROR HANDLING
